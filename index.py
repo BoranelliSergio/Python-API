@@ -11,7 +11,7 @@ import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
+import psycopg2
 
 # Inicializando Flask e CORS (para evitar problemas de Cross-Origin Resource Sharing)
 app = Flask(__name__)
@@ -24,19 +24,23 @@ exchange = ccxt.binance()
 is_monitoring_active = False
 monitoring_lock = Lock()
 monitoring_threads = []  # Lista para manter as threads
-def fetch_ohlcv_data(pair, timeframe):
+latest_bottoms = []
+def fetch_ohlcv_data(pair, timeframe, count=2000):
     limit = 1000  # Limite máximo por chamada
+    all_ohlcv = []
+    
+    while count > 0:
+        # A primeira chamada não terá parâmetro 'since'
+        since = None if not all_ohlcv else all_ohlcv[0][0] - limit * exchange.parse_timeframe(timeframe) * 1000
+        ohlcv = exchange.fetch_ohlcv(pair, timeframe, since=since, limit=min(limit, count))
+        all_ohlcv = ohlcv + all_ohlcv
+        count -= len(ohlcv)  # Decrementa pelo número de velas efetivamente retornadas
 
-    # Primeira chamada para a API
-    first_ohlcv = exchange.fetch_ohlcv(pair, timeframe, limit=limit)
+        # Verifica se a chamada retornou menos velas do que o limite, o que indica que chegamos ao começo dos dados
+        if len(ohlcv) < limit:
+            break
     
-    # Segunda chamada para a API, pegando dados anteriores à primeira vela da primeira chamada
-    last_timestamp = first_ohlcv[0][0]  # Timestamp da primeira vela da primeira chamada
-    second_ohlcv = exchange.fetch_ohlcv(pair, timeframe, limit=limit, since=last_timestamp - limit * exchange.parse_timeframe(timeframe) * 1000)
-    
-    # Concatenando os dois conjuntos de dados
-    ohlcv = second_ohlcv + first_ohlcv
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
     # Configurando fuso horário para UTC e convertendo para UTC-3
@@ -47,12 +51,11 @@ def fetch_ohlcv_data(pair, timeframe):
 def calculate_ema(df, period=200):
     ema = df['close'].ewm(span=period, adjust=False).mean()
     return ema
-
-def calculate_zigzag(df, deviation=0.1, pivot_legs=300, max_points=10):
+def calculate_zigzag(df, deviation=1, pivot_legs=5):
     highs = df['high']
     lows = df['low']
     length = len(df)
-
+    
     tops = []
     bottoms = []
     
@@ -60,49 +63,49 @@ def calculate_zigzag(df, deviation=0.1, pivot_legs=300, max_points=10):
     last_pivot_index = -pivot_legs
     trend = 0
 
-    for i in range(pivot_legs, length):
-        # Janelas para determinar topos e fundos
-        if i < length - pivot_legs:
-            window_high = max(highs[i - pivot_legs:i + pivot_legs + 1])
-            window_low = min(lows[i - pivot_legs:i + pivot_legs + 1])
-        else:
-            window_high = max(highs[i - pivot_legs:])
-            window_low = min(lows[i - pivot_legs:])
+    for i in range(pivot_legs, length - pivot_legs):
+        window_high = max(highs[i - pivot_legs:i + pivot_legs])
+        window_low = min(lows[i - pivot_legs:i + pivot_legs])
 
-        # Identificação dos topos
-        if trend != 1 and highs[i] == window_high:
-            if last_pivot_price is None or highs[i] > last_pivot_price * (1 + deviation / 100):
+        if highs[i] == window_high and (last_pivot_price is None or highs[i] > last_pivot_price * (1 + deviation / 100)):
+            if trend != 1 or last_pivot_index != i - pivot_legs:
                 last_pivot_price = highs[i]
                 last_pivot_index = i
                 trend = 1
                 tops.append((i, highs[i]))
 
-        # Identificação dos fundos
-        elif trend != -1 and lows[i] == window_low:
-            if last_pivot_price is None or lows[i] < last_pivot_price * (1 - deviation / 100):
+        if lows[i] == window_low and (last_pivot_price is None or lows[i] < last_pivot_price * (1 - deviation / 100)):
+            if trend != -1 or last_pivot_index != i - pivot_legs:
                 last_pivot_price = lows[i]
                 last_pivot_index = i
                 trend = -1
                 bottoms.append((i, lows[i]))
-
-    # Limitar o número de pontos a serem retornados
-    tops = tops[-max_points:]
-    bottoms = bottoms[-max_points:]
-
+    
+    # Processar o restante das velas após a última janela
+    for i in range(length - pivot_legs, length):
+        if trend == 1 and highs[i] > last_pivot_price * (1 + deviation / 100):
+            last_pivot_price = highs[i]
+            last_pivot_index = i
+            tops.append((i, highs[i]))
+        elif trend == -1 and lows[i] < last_pivot_price * (1 - deviation / 100):
+            last_pivot_price = lows[i]
+            last_pivot_index = i
+            bottoms.append((i, lows[i]))
+            
     return tops, bottoms
-
 
 def format_zigzag_for_chart(tops, bottoms, df):
     zigzag_points = []
-    for index, value in tops:
-        time_iso = df['timestamp'][index].isoformat()
-        print("Exemplo de timestamp ISO 8601:", time_iso)  # Imprimindo para depuração
-        zigzag_points.append({'time': time_iso, 'value': value, 'type': 'top'})
-    for index, value in bottoms:
-        time_iso = df['timestamp'][index].isoformat()
-        zigzag_points.append({'time': time_iso, 'value': value, 'type': 'bottom'})
+    for index, value in tops + bottoms:
+        # Converter para Unix timestamp considerando o fuso horário UTC-3 São Paulo
+        timestamp = int(df['timestamp'][index].tz_localize(None).timestamp())
+        point_type = 'top' if (index, value) in tops else 'bottom'
+        zigzag_points.append({'time': timestamp, 'value': value, 'type': point_type})
+    
+    # Certifique-se de que os pontos estejam em ordem cronológica
     zigzag_points.sort(key=lambda x: x['time'])
     return zigzag_points
+
 
 def format_bottoms_for_table(bottoms, df):
     formatted_bottoms = []
@@ -150,7 +153,7 @@ def start_monitoring(pairs, timeframe):
             pair = pair.strip()
             try:
                 ohlcv_data = fetch_ohlcv_data(pair, timeframe)
-                tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=200)
+                tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
                 print_monitoring_data(pair, tops, bottoms, ohlcv_data)
 
                 if len(bottoms) > 0 and bottoms[-1][0] == len(ohlcv_data) - 1:
@@ -172,12 +175,20 @@ def print_monitoring_data(pair, tops, bottoms, ohlcv_data):
     log_message = f"Monitorando {pair}:\nÚltimos Topos e Fundos:\n"
 
     if tops:
-        log_message += "Topos:\n" + "\n".join([f"Índice {top[0]}, Valor {top[1]}" for top in tops[-3:]])
+        log_message += "Topos:\n"
+        for top in tops[-3:]:  # Considerando os últimos 3 topos
+            index, value = top
+            time = ohlcv_data['timestamp'][index].strftime('%d/%m/%Y %H:%M:%S')
+            log_message += f"Índice {index}, Valor {value}, Horário {time} UTC-3\n"
     else:
         log_message += "Topos: Nenhum\n"
 
     if bottoms:
-        log_message += "\nFundos:\n" + "\n".join([f"Índice {bottom[0]}, Valor {bottom[1]}" for bottom in bottoms[-3:]])
+        log_message += "\nFundos:\n"
+        for bottom in bottoms[-3:]:  # Considerando os últimos 3 fundos
+            index, value = bottom
+            time = ohlcv_data['timestamp'][index].strftime('%d/%m/%Y %H:%M:%S')
+            log_message += f"Índice {index}, Valor {value}, Horário {time} UTC-3\n"
     else:
         log_message += "\nFundos: Nenhum\n"
 
@@ -213,6 +224,7 @@ def get_monitoring_status():
     return jsonify({'is_active': is_monitoring_active})
 
 def send_new_bottom_alert(pair, value, time):
+    global latest_bottoms
     chat_id = 5045523503
     message = f"*Grupo Boranelli - Monitoramento de Criptomoedas - COMPRA*\n\n{pair} Compra: {value} Horario: {time}"
     image_path = 'images/AlertaCompra.png'  # Caminho da imagem
@@ -221,6 +233,37 @@ def send_new_bottom_alert(pair, value, time):
     body = f"Novo fundo para {pair} encontrado: {value} no horário: {time}"
     send_email(subject, body, "grupo.boranelli@gmail.com")
     send_telegram_photo(chat_id, message, image_path)
+    # Adicione o novo fundo à lista
+    latest_bottoms.append({
+        'pair': pair,
+        'value': value,
+        'time': time
+    })
+     # Opcionalmente, limite o tamanho da lista para evitar crescimento infinito
+    latest_bottoms = latest_bottoms[-10:]  # Mantenha apenas os 10 fundos mais recentes
+
+     # Conectar ao banco de dados e inserir o alerta
+    conn = psycopg2.connect("postgresql://BoranelliSergio:VjU6WIsS4HJD@ep-fancy-fire-69370269.eu-central-1.aws.neon.tech/boranellidb?sslmode=require")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO fund_alerts (pair, value) VALUES (%s, %s)", (pair, value))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+@app.route('/api/v1/fetch_alerts', methods=['GET'])
+def fetch_alerts():
+    conn = psycopg2.connect("postgresql://BoranelliSergio:VjU6WIsS4HJD@ep-fancy-fire-69370269.eu-central-1.aws.neon.tech/boranellidb?sslmode=require")
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM fund_alerts WHERE is_shown = FALSE")
+    alerts = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify({'alerts': alerts})
+   
+@app.route('/api/v1/latest_bottoms', methods=['GET'])
+def get_latest_bottoms():
+    global latest_bottoms
+    return jsonify({'latest_bottoms': latest_bottoms})
 
 def send_telegram_photo(chat_id, message, image_path):
     token = '6827875802:AAEZvm9RA4sRuPP30ef5X9o2B-mga9pYNx0'
@@ -270,13 +313,12 @@ def get_formatted_bottoms():
 
     try:
         ohlcv_data = fetch_ohlcv_data(pair, timeframe)
-        _, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=200)
+        _, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
         formatted_bottoms = format_bottoms_for_table(bottoms, ohlcv_data)
 
         return jsonify({'bottoms': formatted_bottoms})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 def main():
     while True:
         pair = input("Digite a paridade (ex: 'BTC/USDT') ou 'sair' para encerrar: ")
@@ -288,23 +330,26 @@ def main():
         try:
             ohlcv_data = fetch_ohlcv_data(pair, timeframe)
             ema_data = calculate_ema(ohlcv_data, 200)
-            tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=200)
+            tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
 
             ohlcv_data['EMA_200'] = ema_data
             
-            print(f"Dados das 2000 velas para {pair} no intervalo de tempo {timeframe}:")
+            print(f"Dados das 10000 velas para {pair} no intervalo de tempo {timeframe}:")
             print(ohlcv_data[['timestamp', 'close', 'EMA_200']].tail())
 
             print(f"\nTopos identificados: {len(tops)}")
             for top in tops:
-                print(f"Índice: {top[0]}, Valor: {top[1]}")
+                timestamp = ohlcv_data.iloc[top[0]]['timestamp']
+                print(f"Índice: {top[0]}, Valor: {top[1]}, Horário: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
 
             print(f"\nFundos identificados: {len(bottoms)}")
             for bottom in bottoms:
-                print(f"Índice: {bottom[0]}, Valor: {bottom[1]}")
+                timestamp = ohlcv_data.iloc[bottom[0]]['timestamp']
+                print(f"Índice: {bottom[0]}, Valor: {bottom[1]}, Horário: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
 
         except Exception as e:
             print(f"Erro: {e}")
+
 @app.route('/api/v1/data', methods=['GET'])
 def get_data():
     pair = request.args.get('pair', default='BTC/USDT', type=str)
@@ -313,7 +358,7 @@ def get_data():
     try:
         ohlcv_data = fetch_ohlcv_data(pair, timeframe)
         ema_data = calculate_ema(ohlcv_data, 200)
-        tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=200)
+        tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
 
         zigzag_points = format_zigzag_for_chart(tops, bottoms, ohlcv_data)
        
@@ -338,9 +383,9 @@ def get_data():
 @app.route('/api/v1/pairs', methods=['GET'])
 def get_pairs():
     markets = exchange.load_markets()
-    pairs = [market for market in markets if 'USDT' in market and markets[market]['active']]
-    return jsonify({'pairs': pairs[:100]})  # Retorna apenas as primeiras 100 paridades
-
+    stablecoins = ['USDC', 'BUSD', 'DAI', 'TUSD', 'PAX']
+    pairs = [market for market in markets if 'USDT' in market and not any(stablecoin in market for stablecoin in stablecoins) and markets[market]['active']]
+    return jsonify({'pairs': pairs})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))  # Use a porta do ambiente, caso exista, senão use 5000
