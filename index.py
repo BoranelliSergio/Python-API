@@ -141,9 +141,13 @@ def send_email(subject, body, to_address):
     session.quit()
 
     print(f"Email enviado para {to_address} com sucesso.")
+    
 def start_monitoring(pairs, timeframe):
     global is_monitoring_active
     print(f"Alertas ativados para {pairs} no {timeframe}")
+
+    # Dicionário para armazenar o último fundo de cada paridade
+    last_bottoms = {}
 
     # Enviar mensagem inicial de monitoramento
     send_alert_activation_message(pairs, timeframe)
@@ -156,12 +160,24 @@ def start_monitoring(pairs, timeframe):
                 tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
                 print_monitoring_data(pair, tops, bottoms, ohlcv_data)
 
-                if len(bottoms) > 0 and bottoms[-1][0] == len(ohlcv_data) - 1:
+                # Se é a primeira iteração, inicializa o último fundo para a paridade
+                if pair not in last_bottoms and bottoms:
+                    last_bottoms[pair] = bottoms[-1]
+                    continue
+
+                # Verifica se há um novo fundo
+                if bottoms and bottoms[-1] != last_bottoms[pair]:
                     new_bottom = bottoms[-1]
                     timestamp = ohlcv_data['timestamp'][new_bottom[0]]
                     formatted_time = timestamp.strftime('%d/%m/%Y %H:%M')
                     value = new_bottom[1]
+
+                    # Enviar alerta do novo fundo
                     send_new_bottom_alert(pair, value, formatted_time)
+
+                    # Atualizar o último fundo registrado
+                    last_bottoms[pair] = new_bottom
+
             except Exception as e:
                 print(f"Erro ao monitorar {pair}: {e}")
 
@@ -231,7 +247,7 @@ def send_new_bottom_alert(pair, value, time):
     # Enviar e-mail
     subject = "Novo Fundo Encontrado"
     body = f"Novo fundo para {pair} encontrado: {value} no horário: {time}"
-    send_email(subject, body, "grupo.boranelli@gmail.com")
+    #send_email(subject, body, "grupo.boranelli@gmail.com")
     send_telegram_photo(chat_id, message, image_path)
     # Adicione o novo fundo à lista
     latest_bottoms.append({
