@@ -12,6 +12,8 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import psycopg2
+import pandas_ta as ta
+from datetime import datetime
 
 # Inicializando Flask e CORS (para evitar problemas de Cross-Origin Resource Sharing)
 app = Flask(__name__)
@@ -25,6 +27,7 @@ is_monitoring_active = False
 monitoring_lock = Lock()
 monitoring_threads = []  # Lista para manter as threads
 latest_bottoms = []
+last_signals = {}
 def fetch_ohlcv_data(pair, timeframe, count=2000):
     limit = 1000  # Limite máximo por chamada
     all_ohlcv = []
@@ -47,6 +50,36 @@ def fetch_ohlcv_data(pair, timeframe, count=2000):
     df['timestamp'] = df['timestamp'].dt.tz_localize(pytz.utc).dt.tz_convert('America/Sao_Paulo')
     
     return df.drop_duplicates(subset='timestamp').reset_index(drop=True)
+
+def calculate_rsi(df, period=14):
+    rsi = ta.rsi(df['close'], length=period)
+    return rsi
+
+def calculate_sma_of_rsi(rsi, period=14):
+    sma_rsi = ta.sma(rsi, length=period)
+    return sma_rsi
+def find_rsi_sma_cross_ema_signals(df):
+    try:
+        rsi_series = calculate_rsi(df)
+        sma_rsi = calculate_sma_of_rsi(rsi_series)
+        df['EMA_200'] = calculate_ema(df, period=200)  # Calculando EMA de 200 períodos e adicionando ao DataFrame
+
+        crossover_conditions = (rsi_series > sma_rsi) & (rsi_series.shift(1) <= sma_rsi.shift(1))
+        close_above_ema = df['close'] > df['EMA_200']  # Usando a coluna 'EMA_200'
+
+        signals = crossover_conditions & close_above_ema
+        signal_points = df[signals].copy()
+
+        signal_points['RSI'] = rsi_series[signals]
+        signal_points['SMA_RSI'] = sma_rsi[signals]
+        signal_points['EMA'] = df['EMA_200'][signals]  # Referenciando a coluna 'EMA_200'
+
+        return signal_points.reset_index(drop=True)
+    except Exception as e:
+        print(f"Erro ao calcular sinais RSI/SMA/EMA: {e}")
+        return pd.DataFrame()
+
+
 
 def calculate_ema(df, period=200):
     ema = df['close'].ewm(span=period, adjust=False).mean()
@@ -141,7 +174,28 @@ def send_email(subject, body, to_address):
     session.quit()
 
     print(f"Email enviado para {to_address} com sucesso.")
-    
+
+@app.route('/api/v1/spot_signals', methods=['GET'])
+def get_spot_signals():
+    conn = None
+    try:
+        conn = psycopg2.connect("postgresql://BoranelliSergio:VjU6WIsS4HJD@ep-fancy-fire-69370269.eu-central-1.aws.neon.tech/boranellidb?sslmode=require")
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM spot_signals")
+        signals = cur.fetchall()
+
+        # Convertendo os resultados em um formato JSON
+        signals_json = [{"pair": signal[1], "close_value": signal[2], "signal_time": signal[3].strftime('%d/%m/%Y %H:%M:%S')} for signal in signals]
+
+        cur.close()
+        return jsonify({'spot_signals': signals_json})
+    except Exception as e:
+        print(f"Erro ao buscar sinais de compra RSI/SMA/EMA Spot: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
 def start_monitoring(pairs, timeframe):
     global is_monitoring_active
     print(f"Alertas ativados para {pairs} no {timeframe}")
@@ -159,6 +213,20 @@ def start_monitoring(pairs, timeframe):
                 ohlcv_data = fetch_ohlcv_data(pair, timeframe)
                 tops, bottoms = calculate_zigzag(ohlcv_data, deviation=1, pivot_legs=5)
                 print_monitoring_data(pair, tops, bottoms, ohlcv_data)
+                signal_data = find_rsi_sma_cross_ema_signals(ohlcv_data)
+
+                # Se houver sinais e o último sinal for diferente do novo, salve-o
+                if not signal_data.empty:
+                    last_signal_time = signal_data['timestamp'].iloc[-1]
+                    last_signal_close = signal_data['close'].iloc[-1]
+
+                    if pair not in last_signals or last_signals[pair]['timestamp'] != last_signal_time:
+                        # Salvar o sinal no banco de dados
+                        save_signal(pair, last_signal_close, last_signal_time)
+
+                        # Atualizar o registro do último sinal
+                        last_signals[pair] = {'timestamp': last_signal_time, 'close': last_signal_close}
+
 
                 # Se é a primeira iteração, inicializa o último fundo para a paridade
                 if pair not in last_bottoms and bottoms:
@@ -185,6 +253,14 @@ def start_monitoring(pairs, timeframe):
         sleep_time = exchange.parse_timeframe(timeframe) * 1000 - (int(time.time() * 1000) % (exchange.parse_timeframe(timeframe) * 1000))
         time.sleep(sleep_time / 1000)
 
+def save_signal(pair, close_value, signal_time):
+    # Conectar ao banco de dados e inserir o sinal
+    conn = psycopg2.connect("postgresql://BoranelliSergio:VjU6WIsS4HJD@ep-fancy-fire-69370269.eu-central-1.aws.neon.tech/boranellidb?sslmode=require")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO spot_signals (pair, close_value, signal_time) VALUES (%s, %s, %s)", (pair, close_value, signal_time))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 monitoring_logs = []
 def print_monitoring_data(pair, tops, bottoms, ohlcv_data):
@@ -220,6 +296,29 @@ def health_check():
 @app.route('/api/v1/monitoring_logs', methods=['GET'])
 def get_monitoring_logs():
     return jsonify({'logs': monitoring_logs})
+@app.route('/api/v1/rsi_sma_ema_signals', methods=['GET'])
+def get_rsi_sma_ema_signals():
+    pair = request.args.get('pair', default='BTC/USDT', type=str)
+    timeframe = request.args.get('timeframe', default='1d', type=str)
+
+    try:
+        ohlcv_data = fetch_ohlcv_data(pair, timeframe)
+        signal_data = find_rsi_sma_cross_ema_signals(ohlcv_data)
+
+        formatted_signals = []
+        for _, row in signal_data.iterrows():
+            formatted_signals.append({
+                'timestamp': row['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'close': row['close'],
+                'RSI': row['RSI'],
+                'SMA_RSI': row['SMA_RSI'],
+                'EMA': row['EMA_200']
+            })
+        
+        return jsonify({'signals': formatted_signals})
+    except Exception as e:
+        print(f"Error: {e}")  # Log the error for debugging
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/v1/deactivate_alert', methods=['POST'])
 def deactivate_alert():
